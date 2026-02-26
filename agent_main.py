@@ -12,13 +12,17 @@ import socket
 import subprocess
 import threading
 import time
-import tomllib
 import uuid
 from pathlib import Path
 from typing import Any
 
 import requests
 from fastapi import FastAPI
+
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:  # pragma: no cover - runtime compatibility for Python 3.10
+    import tomli as tomllib
 
 
 def _env(name: str, default: str | None = None) -> str | None:

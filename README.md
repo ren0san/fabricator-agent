@@ -19,10 +19,9 @@ sudo apt install -y fabricator-agent
 
 ```bash
 sudo apt update
-sudo apt install -y ca-certificates curl build-essential debhelper dh-python python3 python3-venv
-curl -fsSL -o fabricator-agent.tar.gz https://github.com/ren0san/fabricator-agent/archive/refs/heads/main.tar.gz
-tar -xzf fabricator-agent.tar.gz
-cd fabricator-agent-main
+sudo apt install -y git build-essential debhelper dh-python python3 python3-venv
+git clone https://github.com/ren0san/fabricator-agent.git
+cd fabricator-agent
 dpkg-buildpackage -us -uc -b
 cd ..
 sudo apt install -y ./fabricator-agent_0.1.0-1_all.deb
@@ -67,7 +66,9 @@ curl -s http://127.0.0.1:8010/status
 ```bash
 # 1) build package
 sudo apt update
-sudo apt install -y build-essential debhelper dh-python python3 python3-venv
+sudo apt install -y git build-essential debhelper dh-python python3 python3-venv
+git clone https://github.com/ren0san/fabricator-agent.git
+cd fabricator-agent
 dpkg-buildpackage -us -uc -b
 
 # 2) install package
@@ -271,6 +272,20 @@ E: Unable to locate package fabricator-agent
 ```
 
 it means the Fabricator APT repository is not configured on this machine (or package publication is not set up yet).
+Use "Local .deb install" via GitHub repo in this case.
+
+If you see:
+
+```bash
+sudo: unable to resolve host <hostname>: Name or service not known
+```
+
+fix host mapping (replace `tunnel-DE` with your hostname):
+
+```bash
+hostnamectl --static
+echo "127.0.1.1 tunnel-DE" | sudo tee -a /etc/hosts >/dev/null
+```
 
 If service fails with:
 

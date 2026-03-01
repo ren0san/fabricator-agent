@@ -34,6 +34,86 @@ journalctl -u fabricator-agent -n 50 --no-pager
 
 Package installs and enables `fabricator-agent.service` automatically.
 
+## Complete Install (Ubuntu)
+
+### APT install (recommended)
+
+```bash
+# 1) install package
+sudo apt update
+sudo apt install -y fabricator-agent
+
+# 2) configure runtime env
+sudo tee /etc/default/fabricator-agent >/dev/null <<'EOF'
+AGENT_BACKEND_URL=https://api.thun-der.ru
+AGENT_HTTP_PORT=8010
+AGENT_LOCAL_API_URL=http://127.0.0.1:8000
+AGENT_LOCAL_API_TOKEN=CHANGE_ME_FABRICATOR_TOKEN
+AGENT_ADMIN_TOKEN=CHANGE_ME_STRONG_RANDOM_TOKEN
+EOF
+
+# 3) restart and verify
+sudo systemctl daemon-reload
+sudo systemctl enable --now fabricator-agent
+sudo systemctl restart fabricator-agent
+systemctl status fabricator-agent --no-pager
+curl -s http://127.0.0.1:8010/health
+curl -s http://127.0.0.1:8010/status
+```
+
+### Local .deb install
+
+```bash
+# 1) build package
+sudo apt update
+sudo apt install -y build-essential debhelper dh-python python3 python3-venv
+dpkg-buildpackage -us -uc -b
+
+# 2) install package
+cd ..
+sudo apt install -y ./fabricator-agent_0.1.0-1_all.deb
+
+# 3) configure runtime env
+sudo tee /etc/default/fabricator-agent >/dev/null <<'EOF'
+AGENT_BACKEND_URL=https://api.thun-der.ru
+AGENT_HTTP_PORT=8010
+AGENT_LOCAL_API_URL=http://127.0.0.1:8000
+AGENT_LOCAL_API_TOKEN=CHANGE_ME_FABRICATOR_TOKEN
+AGENT_ADMIN_TOKEN=CHANGE_ME_STRONG_RANDOM_TOKEN
+EOF
+
+# 4) restart and verify
+sudo systemctl daemon-reload
+sudo systemctl enable --now fabricator-agent
+sudo systemctl restart fabricator-agent
+systemctl status fabricator-agent --no-pager
+curl -s http://127.0.0.1:8010/health
+curl -s http://127.0.0.1:8010/status
+```
+
+## Complete Uninstall (Ubuntu)
+
+```bash
+# 1) stop and disable service
+sudo systemctl stop fabricator-agent || true
+sudo systemctl disable fabricator-agent || true
+
+# 2) remove package and orphaned deps
+sudo apt purge -y fabricator-agent
+sudo apt autoremove -y
+
+# 3) remove state/config leftovers
+sudo rm -rf /opt/fabricator-agent
+sudo rm -f /etc/default/fabricator-agent
+sudo rm -f /etc/fabricator-agent/config.toml
+sudo rm -f /lib/systemd/system/fabricator-agent.service
+
+# 4) reload systemd and verify service is gone
+sudo systemctl daemon-reload
+sudo systemctl reset-failed
+systemctl status fabricator-agent --no-pager || true
+```
+
 ## Quick Start (Ubuntu, 5-10 min)
 
 1. Install package:

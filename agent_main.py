@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import secrets
 import socket
 import subprocess
 import threading
@@ -17,7 +18,8 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException, status
+from pydantic import BaseModel
 from requests import HTTPError
 
 try:
@@ -39,6 +41,7 @@ class AgentRuntime:
         self.backend_url = (_env("AGENT_BACKEND_URL", "https://api.thun-der.ru") or "").rstrip("/")
         self.api_token = _env("AGENT_API_TOKEN") or _env("SS14_API_TOKEN")
         self.agent_token = _env("AGENT_TOKEN")
+        self.admin_token = _env("AGENT_ADMIN_TOKEN")
         self.agent_id_file = Path(_env("AGENT_ID_FILE", "/opt/fabricator-agent/agent.id") or "/opt/fabricator-agent/agent.id")
         self.agent_id = self._resolve_agent_id()
         self.hostname = socket.gethostname()
@@ -50,6 +53,9 @@ class AgentRuntime:
         self.token_file = Path(_env("AGENT_TOKEN_FILE", "/opt/fabricator-agent/agent.token") or "/opt/fabricator-agent/agent.token")
         self.poll_seconds = int(_env("AGENT_POLL_SECONDS", "10") or "10")
         self.timeout = int(_env("AGENT_HTTP_TIMEOUT_SECONDS", "10") or "10")
+        self.diagnostic_timeout = int(_env("AGENT_DIAG_TIMEOUT_SECONDS", "45") or "45")
+        self.output_tail_chars = int(_env("AGENT_OUTPUT_TAIL_CHARS", "4000") or "4000")
+        self.fabricator_service_name = _env("AGENT_FABRICATOR_SERVICE", "ss14-provisioner") or "ss14-provisioner"
         self._legacy_auth_disabled = False
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -64,8 +70,25 @@ class AgentRuntime:
             "claim_code": None,
             "paired": False,
             "legacy_auth_disabled": False,
+            "last_diagnostic_name": None,
+            "last_diagnostic_at": None,
+            "last_diagnostic_ok": None,
         }
         self._load_token_file()
+
+    @staticmethod
+    def supported_instruction_kinds() -> list[str]:
+        return [
+            "ping",
+            "set-poll-seconds",
+            "refresh-config",
+            "run-diagnostic",
+            "create-instance",
+            "delete-instance",
+            "restart-instance",
+            "stop-instance",
+            "update-instance",
+        ]
 
     def _resolve_agent_id(self) -> str:
         env_id = _env("AGENT_ID")
@@ -319,6 +342,75 @@ class AgentRuntime:
         self._save_token_file()
         return True
 
+    def _diagnostic_specs(self) -> dict[str, list[str]]:
+        service = self.fabricator_service_name
+        return {
+            "uname": ["uname", "-a"],
+            "os-release": ["cat", "/etc/os-release"],
+            "disk-free": ["df", "-h"],
+            "memory": ["free", "-m"],
+            "fabricator-service-status": ["systemctl", "status", service, "--no-pager", "--full"],
+            "fabricator-agent-service-status": ["systemctl", "status", "fabricator-agent", "--no-pager", "--full"],
+            "fabricator-service-journal-tail": ["journalctl", "-u", service, "-n", "120", "--no-pager"],
+            "fabricator-agent-journal-tail": ["journalctl", "-u", "fabricator-agent", "-n", "120", "--no-pager"],
+        }
+
+    def _run_diagnostic(self, name: str, timeout_seconds: int | None = None) -> tuple[bool, dict[str, Any], str | None]:
+        requested = (name or "").strip().lower()
+        specs = self._diagnostic_specs()
+        cmd = specs.get(requested)
+        if not cmd:
+            return False, {"available": sorted(specs.keys())}, f"unsupported diagnostic name: {requested or '<empty>'}"
+        timeout = timeout_seconds if timeout_seconds and timeout_seconds > 0 else self.diagnostic_timeout
+        started = time.time()
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            ok = proc.returncode == 0
+            result = {
+                "name": requested,
+                "command": cmd,
+                "returncode": proc.returncode,
+                "timeout_seconds": timeout,
+                "duration_ms": int((time.time() - started) * 1000),
+                "stdout_tail": (proc.stdout or "")[-self.output_tail_chars :],
+                "stderr_tail": (proc.stderr or "")[-self.output_tail_chars :],
+            }
+            self.status["last_diagnostic_name"] = requested
+            self.status["last_diagnostic_at"] = time.time()
+            self.status["last_diagnostic_ok"] = ok
+            if ok:
+                return True, result, None
+            return False, result, "diagnostic command failed"
+        except subprocess.TimeoutExpired as exc:
+            result = {
+                "name": requested,
+                "command": cmd,
+                "returncode": None,
+                "timeout_seconds": timeout,
+                "duration_ms": int((time.time() - started) * 1000),
+                "stdout_tail": ((exc.stdout or "") if isinstance(exc.stdout, str) else "")[-self.output_tail_chars :],
+                "stderr_tail": ((exc.stderr or "") if isinstance(exc.stderr, str) else "")[-self.output_tail_chars :],
+            }
+            self.status["last_diagnostic_name"] = requested
+            self.status["last_diagnostic_at"] = time.time()
+            self.status["last_diagnostic_ok"] = False
+            return False, result, "diagnostic command timed out"
+        except FileNotFoundError as exc:
+            self.status["last_diagnostic_name"] = requested
+            self.status["last_diagnostic_at"] = time.time()
+            self.status["last_diagnostic_ok"] = False
+            return False, {"name": requested, "command": cmd}, f"diagnostic command binary is missing: {exc}"
+
+    def _require_admin_token(self, token: str | None) -> None:
+        expected = self.admin_token
+        if not expected:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="AGENT_ADMIN_TOKEN is not configured",
+            )
+        if not token or not secrets.compare_digest(token, expected):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent admin token")
+
     def _execute_instruction(self, item: dict[str, Any]) -> tuple[bool, dict[str, Any], str | None]:
         kind = str(item.get("kind") or "").strip().lower()
         payload = item.get("payload") or {}
@@ -339,19 +431,11 @@ class AgentRuntime:
                 self._register(cfg, cfg_sha)
             self.status["config_sha256"] = cfg_sha
             return True, {"config_sha256": cfg_sha}, None
+        if kind == "run-diagnostic":
+            timeout_seconds = int(payload.get("timeout_seconds") or self.diagnostic_timeout)
+            return self._run_diagnostic(str(payload.get("name") or ""), timeout_seconds=timeout_seconds)
         if kind == "install-watchdog":
-            cmd = str(payload.get("command") or os.getenv("AGENT_WATCHDOG_INSTALL_CMD") or "").strip()
-            if not cmd:
-                return False, {}, "install command is not provided (payload.command or AGENT_WATCHDOG_INSTALL_CMD)"
-            timeout = int(payload.get("timeout_seconds") or 1800)
-            proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
-            ok = proc.returncode == 0
-            result = {
-                "returncode": proc.returncode,
-                "stdout_tail": (proc.stdout or "")[-3000:],
-                "stderr_tail": (proc.stderr or "")[-3000:],
-            }
-            return ok, result, None if ok else "watchdog install command failed"
+            return False, {}, "install-watchdog is disabled; use fixed instruction kinds only"
         if kind in {"create-instance", "delete-instance", "restart-instance", "stop-instance", "update-instance"}:
             local_api = (_env("AGENT_LOCAL_API_URL", "http://127.0.0.1:8000") or "").rstrip("/")
             token = _env("AGENT_LOCAL_API_TOKEN") or self.api_token
@@ -436,6 +520,11 @@ runtime = AgentRuntime()
 app = FastAPI(title="Fabricator Agent", version="0.1.0")
 
 
+class DiagnosticRunRequest(BaseModel):
+    name: str
+    timeout_seconds: int | None = None
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     runtime.start()
@@ -458,5 +547,27 @@ def status() -> dict[str, Any]:
         "backend_url": runtime.backend_url,
         "poll_seconds": runtime.poll_seconds,
         "config_path": str(runtime.config_path),
+        "supported_instruction_kinds": runtime.supported_instruction_kinds(),
+        "diagnostics": sorted(runtime._diagnostic_specs().keys()),
         "status": dict(runtime.status),
     }
+
+
+@app.get("/instructions")
+def instructions() -> dict[str, Any]:
+    return {"supported_instruction_kinds": runtime.supported_instruction_kinds()}
+
+
+@app.get("/diagnostics")
+def diagnostics() -> dict[str, Any]:
+    return {"diagnostics": sorted(runtime._diagnostic_specs().keys())}
+
+
+@app.post("/diagnostics/run")
+def run_diagnostic(
+    body: DiagnosticRunRequest,
+    x_agent_admin_token: str | None = Header(None, alias="X-Agent-Admin-Token"),
+) -> dict[str, Any]:
+    runtime._require_admin_token(x_agent_admin_token)
+    ok, result, error = runtime._run_diagnostic(body.name, timeout_seconds=body.timeout_seconds)
+    return {"ok": ok, "result": result, "error": error}

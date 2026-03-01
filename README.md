@@ -44,6 +44,8 @@ sudo tee /etc/default/fabricator-agent >/dev/null <<'EOF'
 AGENT_BACKEND_URL=https://api.thun-der.ru
 AGENT_HTTP_PORT=8010
 AGENT_LOCAL_API_URL=http://127.0.0.1:8000
+AGENT_TEST_MODE=1
+AGENT_ADMIN_TOKEN=test-admin-token-123
 EOF
 
 # 4) restart and verify
@@ -99,6 +101,8 @@ sudo tee /etc/default/fabricator-agent >/dev/null <<'EOF'
 AGENT_BACKEND_URL=https://api.thun-der.ru
 AGENT_HTTP_PORT=8010
 AGENT_LOCAL_API_URL=http://127.0.0.1:8000
+AGENT_TEST_MODE=1
+AGENT_ADMIN_TOKEN=test-admin-token-123
 EOF
 ```
 
@@ -112,7 +116,7 @@ curl -s http://127.0.0.1:8010/health
 curl -s http://127.0.0.1:8010/status
 ```
 
-4. On backend side complete bind for `agent_id` from `/status`, then wait until `status.paired=true`.
+4. In `AGENT_TEST_MODE=1` backend bind is not required. Agent works in local test mode.
 
 Optional hardening (recommended for production):
 
@@ -143,8 +147,17 @@ Run emergency diagnostic (manual local call):
 ```bash
 curl -s -X POST http://127.0.0.1:8010/diagnostics/run \
   -H "Content-Type: application/json" \
-  -H "X-Agent-Admin-Token: CHANGE_ME_STRONG_RANDOM_TOKEN" \
+  -H "X-Agent-Admin-Token: test-admin-token-123" \
   -d '{"name":"fabricator-agent-service-status","timeout_seconds":30}'
+```
+
+Get local IP:
+
+```bash
+curl -s -X POST http://127.0.0.1:8010/diagnostics/run \
+  -H "Content-Type: application/json" \
+  -H "X-Agent-Admin-Token: test-admin-token-123" \
+  -d '{"name":"ip-local","timeout_seconds":10}'
 ```
 
 ## Defaults (no manual config required)
@@ -168,6 +181,7 @@ curl -s -X POST http://127.0.0.1:8010/diagnostics/run \
 - `AGENT_DIAG_TIMEOUT_SECONDS` (default `45`)
 - `AGENT_OUTPUT_TAIL_CHARS` (default `4000`)
 - `AGENT_FABRICATOR_SERVICE` (default `ss14-provisioner`)
+- `AGENT_TEST_MODE` (default `0`; set `1` to disable backend polling/pairing and run local-only mode)
 
 ## Pairing flow
 
@@ -223,6 +237,7 @@ Response contains `ok`, `error`, and `result` with `returncode`, `stdout_tail`, 
 
 Allowed diagnostic names:
 
+- `ip-local`
 - `uname`
 - `os-release`
 - `disk-free`

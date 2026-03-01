@@ -36,8 +36,16 @@ def _env(name: str, default: str | None = None) -> str | None:
     return v if v else default
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = _env(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 class AgentRuntime:
     def __init__(self) -> None:
+        self.test_mode = _env_bool("AGENT_TEST_MODE", False)
         self.backend_url = (_env("AGENT_BACKEND_URL", "https://api.thun-der.ru") or "").rstrip("/")
         self.api_token = _env("AGENT_API_TOKEN") or _env("SS14_API_TOKEN")
         self.agent_token = _env("AGENT_TOKEN")
@@ -73,6 +81,7 @@ class AgentRuntime:
             "last_diagnostic_name": None,
             "last_diagnostic_at": None,
             "last_diagnostic_ok": None,
+            "mode": "test-local" if self.test_mode else "runtime",
         }
         self._load_token_file()
 
@@ -345,6 +354,7 @@ class AgentRuntime:
     def _diagnostic_specs(self) -> dict[str, list[str]]:
         service = self.fabricator_service_name
         return {
+            "ip-local": ["hostname", "-I"],
             "uname": ["uname", "-a"],
             "os-release": ["cat", "/etc/os-release"],
             "disk-free": ["df", "-h"],
@@ -505,6 +515,9 @@ class AgentRuntime:
             self._stop.wait(self.poll_seconds)
 
     def start(self) -> None:
+        if self.test_mode:
+            self.status["last_error"] = None
+            return
         if self._thread and self._thread.is_alive():
             return
         self._thread = threading.Thread(target=self.loop, name="fabricator-agent", daemon=True)

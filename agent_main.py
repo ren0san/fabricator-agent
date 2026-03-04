@@ -58,6 +58,8 @@ class AgentRuntime:
             _env("AGENT_CONFIG_PATH", "/etc/fabricator-agent/config.toml") or "/etc/fabricator-agent/config.toml"
         )
         self.public_key = _env("AGENT_PUBLIC_KEY")
+        self.bootstrap_token = _env("AGENT_BOOTSTRAP_TOKEN")
+        self.agent_slug = _env("AGENT_SLUG")
         self.token_file = Path(_env("AGENT_TOKEN_FILE", "/opt/fabricator-agent/agent.token") or "/opt/fabricator-agent/agent.token")
         self.poll_seconds = int(_env("AGENT_POLL_SECONDS", "10") or "10")
         self.timeout = int(_env("AGENT_HTTP_TIMEOUT_SECONDS", "10") or "10")
@@ -97,6 +99,7 @@ class AgentRuntime:
             "restart-instance",
             "stop-instance",
             "update-instance",
+            "repair-instance",
         ]
 
     def _resolve_agent_id(self) -> str:
@@ -318,11 +321,18 @@ class AgentRuntime:
             "agent_id": self.agent_id,
             "public_key": self.public_key,
             "hostname": self.hostname,
-            "details": {"location": self.location},
+            "details": {
+                "location": self.location,
+                "slug": self.agent_slug,
+            },
         }
+        headers = {"Content-Type": "application/json"}
+        if self.bootstrap_token:
+            headers["X-Agent-Bootstrap-Token"] = self.bootstrap_token
         res = requests.post(
             f"{self.backend_url}/api/agent/enroll/request",
             json=payload,
+            headers=headers,
             timeout=self.timeout,
         )
         res.raise_for_status()
@@ -446,7 +456,14 @@ class AgentRuntime:
             return self._run_diagnostic(str(payload.get("name") or ""), timeout_seconds=timeout_seconds)
         if kind == "install-watchdog":
             return False, {}, "install-watchdog is disabled; use fixed instruction kinds only"
-        if kind in {"create-instance", "delete-instance", "restart-instance", "stop-instance", "update-instance"}:
+        if kind in {
+            "create-instance",
+            "delete-instance",
+            "restart-instance",
+            "stop-instance",
+            "update-instance",
+            "repair-instance",
+        }:
             local_api = (_env("AGENT_LOCAL_API_URL", "http://127.0.0.1:8000") or "").rstrip("/")
             token = _env("AGENT_LOCAL_API_TOKEN") or self.api_token
             endpoints = {
@@ -455,6 +472,7 @@ class AgentRuntime:
                 "restart-instance": ("POST", f"/api/ss14/instances/{payload.get('slug', '')}/restart"),
                 "stop-instance": ("POST", f"/api/ss14/instances/{payload.get('slug', '')}/stop"),
                 "update-instance": ("POST", f"/api/ss14/instances/{payload.get('slug', '')}/update"),
+                "repair-instance": ("POST", f"/api/ss14/instances/{payload.get('slug', '')}/repair"),
             }
             method, path = endpoints[kind]
             if kind != "create-instance" and not str(payload.get("slug") or "").strip():

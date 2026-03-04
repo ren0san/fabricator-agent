@@ -171,6 +171,8 @@ curl -s -X POST http://127.0.0.1:8010/diagnostics/run \
 
 - `AGENT_ID`
 - `AGENT_PUBLIC_KEY`
+- `AGENT_BOOTSTRAP_TOKEN` (shared bootstrap token for secure auto-bind mode on core)
+- `AGENT_SLUG` (optional preferred node slug sent during enrollment)
 - `AGENT_POLL_SECONDS`
 - `AGENT_HTTP_TIMEOUT_SECONDS`
 - `AGENT_HTTP_PORT`
@@ -199,6 +201,7 @@ If runtime token becomes invalid (for example after rebind/reissue), agent clear
 - `restart-instance`
 - `stop-instance`
 - `update-instance`
+- `repair-instance`
 - `run-diagnostic`
 - `ping`
 - `set-poll-seconds`
@@ -211,6 +214,7 @@ Instruction payload examples (from backend):
 
 - `create-instance`: `{"kind":"create-instance","payload":{"body":{"slug":"alpha","repo":"https://github.com/org/repo","branch":"master"}}}`
 - `restart-instance`: `{"kind":"restart-instance","payload":{"slug":"alpha"}}`
+- `repair-instance`: `{"kind":"repair-instance","payload":{"slug":"alpha"}}`
 - `stop-instance`: `{"kind":"stop-instance","payload":{"slug":"alpha","reason":"maintenance"}}`
 - `run-diagnostic`: `{"kind":"run-diagnostic","payload":{"name":"fabricator-service-journal-tail","timeout_seconds":30}}`
 

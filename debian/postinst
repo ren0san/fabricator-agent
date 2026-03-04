@@ -1,6 +1,21 @@
 #!/bin/sh
 set -e
 
+replace_or_append() {
+  key="$1"
+  value="$2"
+  file="$3"
+  if [ ! -f "$file" ]; then
+    printf "%s=%s\n" "$key" "$value" > "$file"
+    return 0
+  fi
+  if grep -q "^${key}=" "$file"; then
+    sed -i "s|^${key}=.*|${key}=${value}|" "$file"
+  else
+    printf "%s=%s\n" "$key" "$value" >> "$file"
+  fi
+}
+
 if [ "$1" = "configure" ] || [ "$1" = "reconfigure" ]; then
   mkdir -p /opt/fabricator-agent /etc/fabricator-agent
 
@@ -9,6 +24,14 @@ if [ "$1" = "configure" ] || [ "$1" = "reconfigure" ]; then
 # Optional local agent config
 EOF
     chmod 640 /etc/fabricator-agent/config.toml || true
+  fi
+
+  # Migrate old default that forced local test mode and blocked pairing.
+  # If AGENT_ALLOW_TEST_MODE=1 is explicitly set, keep AGENT_TEST_MODE as-is.
+  if [ -f /etc/default/fabricator-agent ] && grep -q '^AGENT_ALLOW_TEST_MODE=1' /etc/default/fabricator-agent; then
+    true
+  else
+    replace_or_append AGENT_TEST_MODE 0 /etc/default/fabricator-agent
   fi
 
   python3 -m venv /opt/fabricator-agent/.venv

@@ -94,6 +94,7 @@ class AgentRuntime:
             "set-poll-seconds",
             "refresh-config",
             "run-diagnostic",
+            "self-update-agent",
             "create-instance",
             "delete-instance",
             "restart-instance",
@@ -421,6 +422,71 @@ class AgentRuntime:
             self.status["last_diagnostic_ok"] = False
             return False, {"name": requested, "command": cmd}, f"diagnostic command binary is missing: {exc}"
 
+    def _run_self_update(self, payload: dict[str, Any]) -> tuple[bool, dict[str, Any], str | None]:
+        payload_command = str(payload.get("command") or "").strip()
+        cmd = payload_command or (
+            _env(
+                "AGENT_SELF_UPDATE_COMMAND",
+                "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade fabricator-agent",
+            )
+            or ""
+        ).strip()
+        if not cmd:
+            return False, {}, "AGENT_SELF_UPDATE_COMMAND is empty"
+        timeout_seconds = int(_env("AGENT_SELF_UPDATE_TIMEOUT_SECONDS", "900") or "900")
+        proc = subprocess.run(
+            ["/bin/sh", "-lc", cmd],
+            capture_output=True,
+            text=True,
+            timeout=max(10, timeout_seconds),
+        )
+        stdout_tail = (proc.stdout or "")[-self.output_tail_chars :]
+        stderr_tail = (proc.stderr or "")[-self.output_tail_chars :]
+        if proc.returncode != 0:
+            return (
+                False,
+                {
+                    "command": cmd,
+                    "returncode": proc.returncode,
+                    "stdout_tail": stdout_tail,
+                    "stderr_tail": stderr_tail,
+                },
+                f"self-update failed with code {proc.returncode}",
+            )
+
+        if "restart" in payload:
+            restart_enabled = bool(payload.get("restart"))
+        else:
+            restart_enabled = _env_bool("AGENT_SELF_UPDATE_RESTART", True)
+        restart_scheduled = False
+        restart_error = None
+        if restart_enabled:
+            try:
+                subprocess.run(
+                    ["/bin/sh", "-lc", "nohup /bin/sh -c 'sleep 2; systemctl restart fabricator-agent' >/dev/null 2>&1 &"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                restart_scheduled = True
+            except Exception as exc:
+                restart_error = str(exc)
+
+        return (
+            True,
+            {
+                "command": cmd,
+                "returncode": 0,
+                "stdout_tail": stdout_tail,
+                "stderr_tail": stderr_tail,
+                "restart_enabled": restart_enabled,
+                "restart_scheduled": restart_scheduled,
+                "restart_error": restart_error,
+            },
+            None,
+        )
+
     def _require_admin_token(self, token: str | None) -> None:
         expected = self.admin_token
         if not expected:
@@ -456,6 +522,8 @@ class AgentRuntime:
             return self._run_diagnostic(str(payload.get("name") or ""), timeout_seconds=timeout_seconds)
         if kind == "install-watchdog":
             return False, {}, "install-watchdog is disabled; use fixed instruction kinds only"
+        if kind == "self-update-agent":
+            return self._run_self_update(payload if isinstance(payload, dict) else {})
         if kind in {
             "create-instance",
             "delete-instance",

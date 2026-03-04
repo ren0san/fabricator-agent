@@ -95,6 +95,7 @@ class AgentRuntime:
             "refresh-config",
             "run-diagnostic",
             "self-update-agent",
+            "create-slug",
             "create-instance",
             "delete-instance",
             "restart-instance",
@@ -499,6 +500,61 @@ class AgentRuntime:
             None,
         )
 
+    def _run_create_slug(self, payload: dict[str, Any]) -> tuple[bool, dict[str, Any], str | None]:
+        body = payload.get("body") if isinstance(payload.get("body"), dict) else {}
+        slug = str((body or {}).get("slug") or "").strip()
+        if not slug:
+            return False, {}, "payload.body.slug is required"
+
+        command = str(payload.get("command") or _env("AGENT_CREATE_SLUG_COMMAND", "") or "").strip()
+        timeout_seconds = int(payload.get("timeout_seconds") or _env("AGENT_CREATE_SLUG_TIMEOUT_SECONDS", "900") or "900")
+        if command:
+            env = os.environ.copy()
+            env["FABRICATOR_SLUG"] = slug
+            env["FABRICATOR_REPO"] = str((body or {}).get("repo") or "")
+            env["FABRICATOR_BRANCH"] = str((body or {}).get("branch") or "master")
+            env["FABRICATOR_PORT"] = str(int((body or {}).get("port") or 1))
+            env["FABRICATOR_PUBLIC_HOST"] = str((body or {}).get("public_host") or "")
+            env["FABRICATOR_HOST_USER"] = str((body or {}).get("host_user") or "")
+            try:
+                proc = subprocess.run(
+                    ["/bin/sh", "-lc", command],
+                    capture_output=True,
+                    text=True,
+                    timeout=max(10, timeout_seconds),
+                    env=env,
+                )
+            except subprocess.TimeoutExpired:
+                return False, {"command": command, "timeout_seconds": timeout_seconds}, "create-slug command timed out"
+            result = {
+                "command": command,
+                "returncode": proc.returncode,
+                "stdout_tail": (proc.stdout or "")[-self.output_tail_chars :],
+                "stderr_tail": (proc.stderr or "")[-self.output_tail_chars :],
+            }
+            if proc.returncode == 0:
+                return True, result, None
+            return False, result, f"create-slug command failed with code {proc.returncode}"
+
+        # Fallback for legacy setups: reuse local create-instance API.
+        local_api = (_env("AGENT_LOCAL_API_URL", "http://127.0.0.1:8000") or "").rstrip("/")
+        token = _env("AGENT_LOCAL_API_TOKEN") or self.api_token
+        headers = {"X-API-Token": token or "", "Content-Type": "application/json"}
+        res = requests.post(
+            f"{local_api}/api/ss14/instances",
+            json=body or {},
+            headers=headers,
+            timeout=self.timeout,
+        )
+        ok = res.status_code < 400
+        try:
+            data: Any = res.json()
+        except Exception:
+            data = {"raw": (res.text or "")[-3000:]}
+        if ok:
+            return True, {"status_code": res.status_code, "response": data, "fallback": "create-instance"}, None
+        return False, {"status_code": res.status_code, "response": data}, "local api fallback failed"
+
     def _require_admin_token(self, token: str | None) -> None:
         expected = self.admin_token
         if not expected:
@@ -536,6 +592,8 @@ class AgentRuntime:
             return False, {}, "install-watchdog is disabled; use fixed instruction kinds only"
         if kind == "self-update-agent":
             return self._run_self_update(payload if isinstance(payload, dict) else {})
+        if kind == "create-slug":
+            return self._run_create_slug(payload if isinstance(payload, dict) else {})
         if kind in {
             "create-instance",
             "delete-instance",

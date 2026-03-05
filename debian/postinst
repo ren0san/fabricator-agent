@@ -34,6 +34,11 @@ EOF
     replace_or_append AGENT_TEST_MODE 0 /etc/default/fabricator-agent
   fi
 
+  PKG_VERSION="$(dpkg-query -W -f='${Version}' fabricator-agent 2>/dev/null || true)"
+  if [ -n "${PKG_VERSION}" ]; then
+    replace_or_append FABRICATOR_AGENT_VERSION "${PKG_VERSION}" /etc/default/fabricator-agent
+  fi
+
   python3 -m venv /opt/fabricator-agent/.venv
   /opt/fabricator-agent/.venv/bin/pip install --upgrade pip >/dev/null
   /opt/fabricator-agent/.venv/bin/pip install -r /opt/fabricator-agent/requirements.txt >/dev/null

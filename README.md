@@ -90,3 +90,13 @@ EOF
 sudo systemctl daemon-reload
 sudo systemctl restart fabricator-agent
 ```
+
+## Version check (terminal)
+
+```bash
+# Direct endpoint
+curl -sS http://127.0.0.1:8010/version | jq
+
+# Helper script
+python3 scripts/show_version.py --url http://127.0.0.1:8010
+```

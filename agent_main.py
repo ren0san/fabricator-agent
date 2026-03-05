@@ -14,6 +14,7 @@ import subprocess
 import threading
 import time
 import uuid
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,35 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+APP_VERSION = (_env("FABRICATOR_AGENT_VERSION", "0.1.0") or "0.1.0").strip() or "0.1.0"
+
+
+def _run_git(*args: str) -> str | None:
+    try:
+        out = subprocess.check_output(
+            ["git", *args],
+            cwd=Path(__file__).resolve().parent,
+            stderr=subprocess.DEVNULL,
+            timeout=2.0,
+            text=True,
+        )
+    except Exception:
+        return None
+    value = out.strip()
+    return value or None
+
+
+@lru_cache(maxsize=1)
+def _build_info() -> dict[str, Any]:
+    return {
+        "service": "fabricator-agent",
+        "version": APP_VERSION,
+        "tag": _run_git("describe", "--tags", "--abbrev=0"),
+        "commit": _run_git("rev-parse", "--short=12", "HEAD"),
+        "dirty": bool(_run_git("status", "--porcelain")),
+    }
 
 
 class AgentRuntime:
@@ -686,7 +716,7 @@ class AgentRuntime:
 
 
 runtime = AgentRuntime()
-app = FastAPI(title="Fabricator Agent", version="0.1.0")
+app = FastAPI(title="Fabricator Agent", version=APP_VERSION)
 
 
 class DiagnosticRunRequest(BaseModel):
@@ -716,10 +746,16 @@ def status() -> dict[str, Any]:
         "backend_url": runtime.backend_url,
         "poll_seconds": runtime.poll_seconds,
         "config_path": str(runtime.config_path),
+        "app": _build_info(),
         "supported_instruction_kinds": runtime.supported_instruction_kinds(),
         "diagnostics": sorted(runtime._diagnostic_specs().keys()),
         "status": dict(runtime.status),
     }
+
+
+@app.get("/version")
+def version() -> dict[str, Any]:
+    return _build_info()
 
 
 @app.get("/instructions")

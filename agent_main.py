@@ -128,6 +128,20 @@ AGENT_VERSION_DISPLAY = (
 )
 
 
+def _default_self_update_command() -> str:
+    return (
+        "if [ -d /root/fabricator-agent/.git ]; then "
+        "cd /root/fabricator-agent && git fetch --all --prune && git checkout main && "
+        "git pull --ff-only origin main && bash scripts/remote_deploy.sh /root/fabricator-agent; "
+        "elif [ -d /opt/fabricator-agent-src/.git ]; then "
+        "cd /opt/fabricator-agent-src && git fetch --all --prune && git checkout main && "
+        "git pull --ff-only origin main && bash scripts/remote_deploy.sh /opt/fabricator-agent-src; "
+        "else "
+        "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade fabricator-agent; "
+        "fi"
+    )
+
+
 def _run_git(*args: str) -> str | None:
     try:
         out = subprocess.check_output(
@@ -566,7 +580,7 @@ class AgentRuntime:
         cmd = payload_command or (
             _env(
                 "AGENT_SELF_UPDATE_COMMAND",
-                "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade fabricator-agent",
+                _default_self_update_command(),
             )
             or ""
         ).strip()

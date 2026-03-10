@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import logging
 import os
 import secrets
 import socket
@@ -36,6 +37,9 @@ def _env(name: str, default: str | None = None) -> str | None:
         return default
     v = v.strip()
     return v if v else default
+
+
+logger = logging.getLogger("fabricator-agent")
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -142,6 +146,18 @@ def _default_self_update_command() -> str:
     )
 
 
+def _detached_popen(cmd: str, *, env: dict[str, str]) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        ["/bin/sh", "-lc", cmd],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        env=env,
+        text=True,
+        start_new_session=True,
+    )
+
+
 def _run_git(*args: str) -> str | None:
     try:
         out = subprocess.check_output(
@@ -204,6 +220,12 @@ class AgentRuntime:
             "last_heartbeat_at": None,
             "last_pull_at": None,
             "last_instruction_count": 0,
+            "last_instruction_id": None,
+            "last_instruction_kind": None,
+            "last_instruction_at": None,
+            "last_instruction_ok": None,
+            "last_instruction_error": None,
+            "last_instruction_result": None,
             "config_sha256": None,
             "claim_code": None,
             "paired": False,
@@ -455,6 +477,33 @@ class AgentRuntime:
             return
         res.raise_for_status()
 
+    def _progress(
+        self,
+        instruction_id: str,
+        *,
+        execution_state: str,
+        stage: str | None = None,
+        message: str | None = None,
+        result: dict[str, Any] | None = None,
+    ) -> None:
+        if not self.agent_token:
+            return
+        res = requests.post(
+            f"{self.backend_url}/api/agent/runtime/{self.agent_id}/instructions/{instruction_id}/progress",
+            json={
+                "execution_state": str(execution_state or "").strip().lower(),
+                "stage": str(stage or "").strip().lower() or None,
+                "message": str(message or "").strip() or None,
+                "result": result or None,
+            },
+            headers=self._runtime_headers(),
+            timeout=self.timeout,
+        )
+        if res.status_code == 401:
+            self._invalidate_runtime_token("Runtime token rejected while sending progress; re-enrolling")
+            return
+        res.raise_for_status()
+
     def _enroll_request(self) -> None:
         payload = {
             "agent_id": self.agent_id,
@@ -586,12 +635,52 @@ class AgentRuntime:
         ).strip()
         if not cmd:
             return False, {}, "AGENT_SELF_UPDATE_COMMAND is empty"
+        if "restart" in payload:
+            restart_enabled = bool(payload.get("restart"))
+        else:
+            restart_enabled = _env_bool("AGENT_SELF_UPDATE_RESTART", True)
+        env = os.environ.copy()
+        env["FABRICATOR_AGENT_ID"] = self.agent_id
+        env["FABRICATOR_AGENT_BACKEND_URL"] = self.backend_url
+        env["FABRICATOR_AGENT_SOURCE_REPO"] = str(payload.get("source_repo") or "").strip()
+        env["FABRICATOR_AGENT_SOURCE_BRANCH"] = str(payload.get("source_branch") or "").strip()
+        env["FABRICATOR_AGENT_TARGET_VERSION"] = str(payload.get("target_version") or "").strip()
+        env["FABRICATOR_AGENT_TARGET_BUILD"] = str(payload.get("target_build") or "").strip()
+        logger.info(
+            "Starting self-update restart=%s source_repo=%s source_branch=%s target_version=%s target_build=%s",
+            restart_enabled,
+            env["FABRICATOR_AGENT_SOURCE_REPO"] or "-",
+            env["FABRICATOR_AGENT_SOURCE_BRANCH"] or "-",
+            env["FABRICATOR_AGENT_TARGET_VERSION"] or "-",
+            env["FABRICATOR_AGENT_TARGET_BUILD"] or "-",
+        )
+        if restart_enabled:
+            try:
+                proc = _detached_popen(cmd, env=env)
+            except Exception as exc:
+                return False, {}, f"failed to start detached self-update: {exc}"
+            return (
+                True,
+                {
+                    "mode": "detached",
+                    "pid": int(proc.pid),
+                    "command": cmd,
+                    "restart": True,
+                    "source_repo": env["FABRICATOR_AGENT_SOURCE_REPO"] or None,
+                    "source_branch": env["FABRICATOR_AGENT_SOURCE_BRANCH"] or None,
+                    "target_version": env["FABRICATOR_AGENT_TARGET_VERSION"] or None,
+                    "target_build": env["FABRICATOR_AGENT_TARGET_BUILD"] or None,
+                    "note": "self-update scheduled; agent restart may interrupt further logs",
+                },
+                None,
+            )
         timeout_seconds = int(_env("AGENT_SELF_UPDATE_TIMEOUT_SECONDS", "900") or "900")
         proc = subprocess.run(
             ["/bin/sh", "-lc", cmd],
             capture_output=True,
             text=True,
             timeout=max(10, timeout_seconds),
+            env=env,
         )
         stdout_tail = (proc.stdout or "")[-self.output_tail_chars :]
         stderr_tail = (proc.stderr or "")[-self.output_tail_chars :]
@@ -599,43 +688,32 @@ class AgentRuntime:
             return (
                 False,
                 {
+                    "mode": "inline",
                     "command": cmd,
                     "returncode": proc.returncode,
+                    "source_repo": env["FABRICATOR_AGENT_SOURCE_REPO"] or None,
+                    "source_branch": env["FABRICATOR_AGENT_SOURCE_BRANCH"] or None,
+                    "target_version": env["FABRICATOR_AGENT_TARGET_VERSION"] or None,
+                    "target_build": env["FABRICATOR_AGENT_TARGET_BUILD"] or None,
                     "stdout_tail": stdout_tail,
                     "stderr_tail": stderr_tail,
                 },
                 f"self-update failed with code {proc.returncode}",
             )
 
-        if "restart" in payload:
-            restart_enabled = bool(payload.get("restart"))
-        else:
-            restart_enabled = _env_bool("AGENT_SELF_UPDATE_RESTART", True)
-        restart_scheduled = False
-        restart_error = None
-        if restart_enabled:
-            try:
-                subprocess.run(
-                    ["/bin/sh", "-lc", "nohup /bin/sh -c 'sleep 2; systemctl restart fabricator-agent' >/dev/null 2>&1 &"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                    check=False,
-                )
-                restart_scheduled = True
-            except Exception as exc:
-                restart_error = str(exc)
-
         return (
             True,
             {
+                "mode": "inline",
                 "command": cmd,
                 "returncode": 0,
+                "source_repo": env["FABRICATOR_AGENT_SOURCE_REPO"] or None,
+                "source_branch": env["FABRICATOR_AGENT_SOURCE_BRANCH"] or None,
+                "target_version": env["FABRICATOR_AGENT_TARGET_VERSION"] or None,
+                "target_build": env["FABRICATOR_AGENT_TARGET_BUILD"] or None,
                 "stdout_tail": stdout_tail,
                 "stderr_tail": stderr_tail,
-                "restart_enabled": restart_enabled,
-                "restart_scheduled": restart_scheduled,
-                "restart_error": restart_error,
+                "restart": False,
             },
             None,
         )
@@ -676,9 +754,16 @@ class AgentRuntime:
                 return True, result, None
             return False, result, f"create-slug command failed with code {proc.returncode}"
 
-        # Fallback for legacy setups: reuse local create-instance API.
-        local_api = (_env("AGENT_LOCAL_API_URL", "http://127.0.0.1:8000") or "").rstrip("/")
+        # Remote-only agents must not silently assume a local fabricator backend.
+        local_api = (_env("AGENT_LOCAL_API_URL") or "").rstrip("/")
         token = _env("AGENT_LOCAL_API_TOKEN") or self.api_token
+        if not local_api:
+            return (
+                False,
+                {},
+                "remote agent has no local fabricator API configured; "
+                "set payload.command/AGENT_CREATE_SLUG_COMMAND or explicitly configure AGENT_LOCAL_API_URL",
+            )
         headers = {"X-API-Token": token or "", "Content-Type": "application/json"}
         res = requests.post(
             f"{local_api}/api/ss14/instances",
@@ -742,7 +827,7 @@ class AgentRuntime:
             "update-instance",
             "repair-instance",
         }:
-            local_api = (_env("AGENT_LOCAL_API_URL", "http://127.0.0.1:8000") or "").rstrip("/")
+            local_api = (_env("AGENT_LOCAL_API_URL") or "").rstrip("/")
             token = _env("AGENT_LOCAL_API_TOKEN") or self.api_token
             endpoints = {
                 "create-instance": ("POST", "/api/ss14/instances"),
@@ -755,6 +840,15 @@ class AgentRuntime:
             method, path = endpoints[kind]
             if kind != "create-instance" and not str(payload.get("slug") or "").strip():
                 return False, {}, "payload.slug is required"
+            if not local_api:
+                if kind == "create-instance":
+                    return (
+                        False,
+                        {},
+                        "remote agent has no local fabricator API configured; "
+                        "explicitly configure AGENT_LOCAL_API_URL for create-instance",
+                    )
+                return False, {}, "AGENT_LOCAL_API_URL is not configured for remote instance control"
             url = f"{local_api}{path}"
             headers = {"X-API-Token": token or "", "Content-Type": "application/json"}
             kwargs: dict[str, Any] = {"headers": headers, "timeout": self.timeout}
@@ -778,6 +872,7 @@ class AgentRuntime:
 
     def loop(self) -> None:
         while not self._stop.is_set():
+            cycle_error: str | None = None
             try:
                 if not self.agent_token:
                     if not self.status.get("claim_code"):
@@ -795,12 +890,46 @@ class AgentRuntime:
                     # Re-register when config changed.
                     self._register(cfg, cfg_sha)
                 self._heartbeat(cfg_sha)
-                for item in self._pull():
+                items = self._pull()
+                self.status["last_instruction_count"] = len(items)
+                for item in items:
                     instruction_id = str(item.get("id") or "")
-                    ok, result, error = self._execute_instruction(item)
+                    instruction_kind = str(item.get("kind") or "").strip().lower() or None
+                    self.status["last_instruction_id"] = instruction_id or None
+                    self.status["last_instruction_kind"] = instruction_kind
+                    self.status["last_instruction_at"] = time.time()
+                    if instruction_id:
+                        try:
+                            self._progress(
+                                instruction_id,
+                                execution_state="accepted",
+                                stage="accepted",
+                                message="instruction accepted by agent",
+                            )
+                        except Exception:
+                            logger.exception("Instruction progress update failed stage=accepted id=%s", instruction_id)
+                    try:
+                        if instruction_id:
+                            try:
+                                self._progress(
+                                    instruction_id,
+                                    execution_state="running",
+                                    stage="running",
+                                    message="instruction execution started",
+                                )
+                            except Exception:
+                                logger.exception("Instruction progress update failed stage=running id=%s", instruction_id)
+                        ok, result, error = self._execute_instruction(item)
+                    except Exception as exc:
+                        ok, result, error = False, {}, str(exc)
+                    self.status["last_instruction_ok"] = bool(ok)
+                    self.status["last_instruction_error"] = error
+                    self.status["last_instruction_result"] = result or {}
+                    if error:
+                        cycle_error = error
                     if instruction_id:
                         self._ack(instruction_id, ok=ok, result=result, error=error)
-                self.status["last_error"] = None
+                self.status["last_error"] = cycle_error
             except Exception as exc:
                 if isinstance(exc, HTTPError) and getattr(exc, "response", None) is not None:
                     response = exc.response

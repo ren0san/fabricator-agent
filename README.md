@@ -33,16 +33,26 @@ curl -sS http://127.0.0.1:8010/status
 sudo apt update
 sudo apt install -y git
 cd /root
-if [ ! -d fabricator-agent/.git ]; then
-  git clone https://github.com/ren0san/fabricator-agent.git
+if [ ! -d /root/fabricator-agent/.git ]; then
+  git clone https://github.com/ren0san/fabricator-agent.git /root/fabricator-agent
 fi
-cd fabricator-agent
+cd /root/fabricator-agent
+git remote set-url origin https://github.com/ren0san/fabricator-agent.git
+git remote -v
 git fetch --all --prune
 git checkout main
-git pull --ff-only origin main
+git reset --hard origin/main
+git log -1 --oneline
+grep -n "FABRICATOR_AGENT_SOURCE_REPO" agent_main.py
+grep -n "last_instruction_id" agent_main.py
 sudo bash scripts/remote_deploy.sh /root/fabricator-agent
+sudo systemctl restart fabricator-agent
+sleep 5
 systemctl status fabricator-agent --no-pager || true
-curl -sS http://127.0.0.1:8010/status
+curl -sS http://127.0.0.1:8010/status | jq
+grep -n "FABRICATOR_AGENT_SOURCE_REPO" /opt/fabricator-agent/agent_main.py
+grep -n "last_instruction_id" /opt/fabricator-agent/agent_main.py
+journalctl -u fabricator-agent -n 50 --no-pager
 ```
 
 ## Complete Uninstall (Ubuntu)
@@ -76,7 +86,7 @@ By default installation works without manual env setup. If needed, override defa
 sudo tee /etc/default/fabricator-agent >/dev/null <<'EOF'
 AGENT_BACKEND_URL=https://api.thun-der.ru
 AGENT_HTTP_PORT=8010
-AGENT_LOCAL_API_URL=http://127.0.0.1:8000
+AGENT_LOCAL_API_URL=
 AGENT_TEST_MODE=0
 AGENT_PUBLIC_IP=
 

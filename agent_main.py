@@ -873,13 +873,61 @@ class AgentRuntime:
             except Exception:
                 pass
 
-    def _embedded_restart_watchdog(self, service_name: str) -> None:
-        subprocess.run(
-            ["systemctl", "restart", service_name],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+    def _embedded_guess_watchdog_services(self, service_name: str) -> list[str]:
+        candidates: list[str] = []
+        explicit = str(service_name or "").strip()
+        if explicit:
+            candidates.append(explicit)
+            if not explicit.endswith(".service"):
+                candidates.append(f"{explicit}.service")
+        candidates.extend(
+            [
+                "SS14.Watchdog",
+                "SS14.Watchdog.service",
+                "ss14-watchdog",
+                "ss14-watchdog.service",
+            ]
         )
+        try:
+            proc = subprocess.run(
+                ["systemctl", "list-unit-files", "--type=service", "--no-legend", "--no-pager"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            for line in (proc.stdout or "").splitlines():
+                name = line.strip().split(None, 1)[0]
+                low = name.lower()
+                if "watchdog" in low and "ss14" in low:
+                    candidates.append(name)
+        except Exception:
+            pass
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for candidate in candidates:
+            normalized = candidate.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            ordered.append(normalized)
+        return ordered
+
+    def _embedded_restart_watchdog(self, service_name: str) -> str:
+        errors: list[str] = []
+        for candidate in self._embedded_guess_watchdog_services(service_name):
+            proc = subprocess.run(
+                ["systemctl", "restart", candidate],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            if proc.returncode == 0:
+                return candidate
+            errors.append(f"{candidate}: rc={proc.returncode} {(proc.stderr or '').strip()}")
+        raise RuntimeError("watchdog restart failed; tried: " + " | ".join(errors[-4:]))
 
     def _embedded_notify_watchdog_update(self, watchdog_url: str, slug: str, api_token: str) -> dict[str, Any]:
         try:
@@ -1023,7 +1071,7 @@ class AgentRuntime:
             self._embedded_fix_ownership(inst_dir, wd_fs_user, wd_fs_group)
             self._embedded_fix_ownership(fragments_dir, wd_fs_user, wd_fs_group, recursive=False)
             self._embedded_fix_ownership(instances_dir, wd_fs_user, wd_fs_group, recursive=False)
-            self._embedded_restart_watchdog(watchdog_service)
+            restarted_service = self._embedded_restart_watchdog(watchdog_service)
             update_result = self._embedded_notify_watchdog_update(watchdog_url, slug, api_token)
             return True, {
                 "mode": "embedded",
@@ -1034,6 +1082,7 @@ class AgentRuntime:
                 "dir_path": str(inst_dir),
                 "fragment_path": str(frag_file),
                 "token": api_token,
+                "watchdog_service": restarted_service,
                 "watchdog_update": update_result,
             }, None
         except Exception as exc:

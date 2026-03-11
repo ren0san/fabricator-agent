@@ -13,6 +13,7 @@ import os
 import pwd
 import grp
 import secrets
+import shlex
 import shutil
 import socket
 import subprocess
@@ -1037,11 +1038,84 @@ class AgentRuntime:
                 return [str(path)]
         raise RuntimeError(f"SS14.Watchdog executable not found under {wd_root}")
 
+    def _embedded_dotnet_command(self) -> list[str]:
+        candidates = [
+            _env("SS14_DOTNET", None),
+            shutil.which("dotnet"),
+            "/opt/dotnet/dotnet",
+            "/usr/bin/dotnet",
+        ]
+        for candidate in candidates:
+            value = str(candidate or "").strip()
+            if not value:
+                continue
+            path = Path(value)
+            if path.exists() or shutil.which(value):
+                return [value]
+        raise RuntimeError("dotnet SDK/runtime not found; install .NET 10 SDK or set SS14_DOTNET")
+
+    def _embedded_ensure_watchdog_source(self, source_dir: Path, repo_url: str, branch: str) -> None:
+        source_dir.parent.mkdir(parents=True, exist_ok=True)
+        git_cmd = shutil.which("git")
+        if not git_cmd:
+            raise RuntimeError("git not found; cannot bootstrap SS14.Watchdog")
+        if not (source_dir / ".git").exists():
+            subprocess.run(
+                [git_cmd, "clone", "--recursive", repo_url, str(source_dir)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=600,
+                check=True,
+            )
+        subprocess.run([git_cmd, "fetch", "--all", "--prune"], cwd=source_dir, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=300, check=True)
+        subprocess.run([git_cmd, "checkout", branch], cwd=source_dir, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=120, check=True)
+        subprocess.run([git_cmd, "pull", "--ff-only", "origin", branch], cwd=source_dir, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=300, check=True)
+        subprocess.run([git_cmd, "submodule", "update", "--init", "--recursive"], cwd=source_dir, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=600, check=True)
+
+    def _embedded_install_watchdog(self, wd_root: Path) -> list[str]:
+        repo_url = _env("SS14_WD_SOURCE_REPO", "https://github.com/space-wizards/SS14.Watchdog") or "https://github.com/space-wizards/SS14.Watchdog"
+        branch = _env("SS14_WD_SOURCE_BRANCH", "master") or "master"
+        source_dir = Path(_env("SS14_WD_SOURCE_DIR", str(wd_root.parent / "src" / "SS14.Watchdog")) or str(wd_root.parent / "src" / "SS14.Watchdog"))
+        publish_dir = Path(_env("SS14_WD_PUBLISH_DIR", str(wd_root.parent / "publish")) or str(wd_root.parent / "publish"))
+        dotnet_cmd = self._embedded_dotnet_command()
+        self._embedded_ensure_watchdog_source(source_dir, repo_url, branch)
+        if publish_dir.exists():
+            shutil.rmtree(publish_dir, ignore_errors=True)
+        publish_dir.mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        env.setdefault("DOTNET_CLI_HOME", "/tmp")
+        subprocess.run(
+            [*dotnet_cmd, "publish", "-c", "Release", "-r", "linux-x64", "--no-self-contained", "-o", str(publish_dir)],
+            cwd=source_dir,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=1800,
+            check=True,
+        )
+        wd_root.mkdir(parents=True, exist_ok=True)
+        for entry in publish_dir.iterdir():
+            if entry.name in {"appsettings.yml", "appsettings.base.yml"} and (wd_root / entry.name).exists():
+                continue
+            target = wd_root / entry.name
+            if entry.is_dir():
+                if target.exists():
+                    shutil.rmtree(target, ignore_errors=True)
+                shutil.copytree(entry, target)
+            else:
+                shutil.copy2(entry, target)
+        return self._embedded_find_watchdog_command(wd_root)
+
     def _embedded_bootstrap_watchdog_service(self, service_name: str, wd_root: Path, user: str, group: str) -> str:
         unit_name = str(service_name or "").strip() or "ss14-watchdog.service"
         if not unit_name.endswith(".service"):
             unit_name = f"{unit_name}.service"
-        exec_parts = self._embedded_find_watchdog_command(wd_root)
+        try:
+            exec_parts = self._embedded_find_watchdog_command(wd_root)
+        except RuntimeError:
+            exec_parts = self._embedded_install_watchdog(wd_root)
         exec_start = " ".join(shlex.quote(part) for part in exec_parts)
         unit_path = Path("/etc/systemd/system") / unit_name
         unit_body = (

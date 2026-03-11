@@ -1087,15 +1087,20 @@ class AgentRuntime:
         install_dir.mkdir(parents=True, exist_ok=True)
         env = os.environ.copy()
         env.setdefault("DOTNET_CLI_HOME", "/tmp")
-        subprocess.run(
-            ["/bin/sh", str(install_script), "--channel", "10.0", "--install-dir", str(install_dir)],
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=1800,
-            check=True,
-        )
+        bash = shutil.which("bash") or "/bin/bash"
+        try:
+            subprocess.run(
+                [bash, str(install_script), "--channel", "10.0", "--install-dir", str(install_dir)],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=1800,
+                check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            stderr_tail = str(exc.stderr or "").strip()[-1200:]
+            raise RuntimeError(f"dotnet-install.sh failed with code {exc.returncode}: {stderr_tail or 'no stderr'}")
         if not preferred.exists():
             raise RuntimeError(f"dotnet 10 installation completed but {preferred} was not found")
         return [str(preferred)]

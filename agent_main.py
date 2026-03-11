@@ -1240,6 +1240,55 @@ class AgentRuntime:
             errors.append(f"{bootstrapped}: rc={proc.returncode} {(proc.stderr or '').strip()}")
         raise RuntimeError("watchdog restart failed; tried: " + " | ".join(errors[-4:]))
 
+    def _embedded_wait_watchdog_api(self, watchdog_url: str, service_name: str) -> None:
+        try:
+            parsed = urlparse(watchdog_url)
+            host = parsed.hostname or "127.0.0.1"
+            port = int(parsed.port or (443 if parsed.scheme == "https" else 80))
+        except Exception:
+            host, port = "127.0.0.1", 13000
+        deadline = time.time() + max(5, int(_env("SS14_WD_READY_TIMEOUT_SECONDS", "25") or "25"))
+        last_error = ""
+        while time.time() < deadline:
+            try:
+                with socket.create_connection((host, port), timeout=2.0):
+                    return
+            except OSError as exc:
+                last_error = str(exc)
+                time.sleep(1.0)
+        status_tail = ""
+        journal_tail = ""
+        try:
+            proc = subprocess.run(
+                ["systemctl", "status", service_name, "--no-pager", "--full"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            status_tail = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()[-self.output_tail_chars :]
+        except Exception:
+            status_tail = ""
+        try:
+            proc = subprocess.run(
+                ["journalctl", "-u", service_name, "-n", "80", "--no-pager"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            journal_tail = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()[-self.output_tail_chars :]
+        except Exception:
+            journal_tail = ""
+        parts = [f"watchdog API did not become ready at {watchdog_url}"]
+        if last_error:
+            parts.append(last_error)
+        if status_tail:
+            parts.append(f"systemctl: {status_tail}")
+        if journal_tail:
+            parts.append(f"journal: {journal_tail}")
+        raise RuntimeError(" | ".join(parts))
+
     def _embedded_notify_watchdog_update(self, watchdog_url: str, slug: str, api_token: str) -> dict[str, Any]:
         try:
             parsed = urlparse(watchdog_url)
@@ -1383,6 +1432,7 @@ class AgentRuntime:
             self._embedded_fix_ownership(fragments_dir, wd_fs_user, wd_fs_group, recursive=False)
             self._embedded_fix_ownership(instances_dir, wd_fs_user, wd_fs_group, recursive=False)
             restarted_service = self._embedded_restart_watchdog(watchdog_service, wd_root, wd_fs_user, wd_fs_group)
+            self._embedded_wait_watchdog_api(watchdog_url, restarted_service)
             update_result = self._embedded_notify_watchdog_update(watchdog_url, slug, api_token)
             return True, {
                 "mode": "embedded",

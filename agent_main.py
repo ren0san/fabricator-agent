@@ -1054,6 +1054,52 @@ class AgentRuntime:
                 return [value]
         raise RuntimeError("dotnet SDK/runtime not found; install .NET 10 SDK or set SS14_DOTNET")
 
+    def _embedded_ensure_dotnet_sdk(self) -> list[str]:
+        preferred = Path(_env("SS14_DOTNET", "/opt/dotnet/dotnet") or "/opt/dotnet/dotnet")
+        try:
+            existing = self._embedded_dotnet_command()
+        except RuntimeError:
+            existing = [str(preferred)]
+        try:
+            proc = subprocess.run(
+                [*existing, "--list-sdks"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            if proc.returncode == 0 and any(line.strip().startswith("10.") for line in (proc.stdout or "").splitlines()):
+                return existing
+        except Exception:
+            pass
+
+        install_script = Path("/tmp/dotnet-install.sh")
+        installer_url = _env("SS14_DOTNET_INSTALL_URL", "https://dot.net/v1/dotnet-install.sh") or "https://dot.net/v1/dotnet-install.sh"
+        try:
+            res = requests.get(installer_url, timeout=60)
+            res.raise_for_status()
+            install_script.write_text(res.text, encoding="utf-8")
+            install_script.chmod(0o755)
+        except Exception as exc:
+            raise RuntimeError(f"failed to download dotnet-install.sh: {exc}")
+
+        install_dir = preferred.parent
+        install_dir.mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        env.setdefault("DOTNET_CLI_HOME", "/tmp")
+        subprocess.run(
+            ["/bin/sh", str(install_script), "--channel", "10.0", "--install-dir", str(install_dir)],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=1800,
+            check=True,
+        )
+        if not preferred.exists():
+            raise RuntimeError(f"dotnet 10 installation completed but {preferred} was not found")
+        return [str(preferred)]
+
     def _embedded_ensure_watchdog_source(self, source_dir: Path, repo_url: str, branch: str) -> None:
         source_dir.parent.mkdir(parents=True, exist_ok=True)
         git_cmd = shutil.which("git")
@@ -1078,7 +1124,7 @@ class AgentRuntime:
         branch = _env("SS14_WD_SOURCE_BRANCH", "master") or "master"
         source_dir = Path(_env("SS14_WD_SOURCE_DIR", str(wd_root.parent / "src" / "SS14.Watchdog")) or str(wd_root.parent / "src" / "SS14.Watchdog"))
         publish_dir = Path(_env("SS14_WD_PUBLISH_DIR", str(wd_root.parent / "publish")) or str(wd_root.parent / "publish"))
-        dotnet_cmd = self._embedded_dotnet_command()
+        dotnet_cmd = self._embedded_ensure_dotnet_sdk()
         self._embedded_ensure_watchdog_source(source_dir, repo_url, branch)
         if publish_dir.exists():
             shutil.rmtree(publish_dir, ignore_errors=True)

@@ -1085,8 +1085,37 @@ class AgentRuntime:
         publish_dir.mkdir(parents=True, exist_ok=True)
         env = os.environ.copy()
         env.setdefault("DOTNET_CLI_HOME", "/tmp")
+        publish_ok = False
+        try:
+            subprocess.run(
+                [*dotnet_cmd, "publish", "-c", "Release", "-r", "linux-x64", "--no-self-contained", "-o", str(publish_dir)],
+                cwd=source_dir,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=1800,
+                check=True,
+            )
+            publish_ok = True
+        except subprocess.CalledProcessError:
+            publish_ok = False
+        wd_root.mkdir(parents=True, exist_ok=True)
+        if publish_ok:
+            for entry in publish_dir.iterdir():
+                if entry.name in {"appsettings.yml", "appsettings.base.yml"} and (wd_root / entry.name).exists():
+                    continue
+                target = wd_root / entry.name
+                if entry.is_dir():
+                    if target.exists():
+                        shutil.rmtree(target, ignore_errors=True)
+                    shutil.copytree(entry, target)
+                else:
+                    shutil.copy2(entry, target)
+            return self._embedded_find_watchdog_command(wd_root)
+
         subprocess.run(
-            [*dotnet_cmd, "publish", "-c", "Release", "-r", "linux-x64", "--no-self-contained", "-o", str(publish_dir)],
+            [*dotnet_cmd, "build", "-c", "Release"],
             cwd=source_dir,
             env=env,
             stdout=subprocess.DEVNULL,
@@ -1095,18 +1124,11 @@ class AgentRuntime:
             timeout=1800,
             check=True,
         )
-        wd_root.mkdir(parents=True, exist_ok=True)
-        for entry in publish_dir.iterdir():
-            if entry.name in {"appsettings.yml", "appsettings.base.yml"} and (wd_root / entry.name).exists():
-                continue
-            target = wd_root / entry.name
-            if entry.is_dir():
-                if target.exists():
-                    shutil.rmtree(target, ignore_errors=True)
-                shutil.copytree(entry, target)
-            else:
-                shutil.copy2(entry, target)
-        return self._embedded_find_watchdog_command(wd_root)
+        built_dlls = sorted(source_dir.glob("**/bin/Release/**/SS14.Watchdog.dll"))
+        for dll in built_dlls:
+            if dll.is_file():
+                return ["dotnet", str(dll)]
+        raise RuntimeError("SS14.Watchdog build succeeded but SS14.Watchdog.dll was not found")
 
     def _embedded_bootstrap_watchdog_service(self, service_name: str, wd_root: Path, user: str, group: str) -> str:
         unit_name = str(service_name or "").strip() or "ss14-watchdog.service"

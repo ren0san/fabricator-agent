@@ -1259,7 +1259,26 @@ class AgentRuntime:
             exec_parts = self._embedded_find_watchdog_command(wd_root)
         except RuntimeError:
             exec_parts = self._embedded_install_watchdog(wd_root)
+        dotnet_root = ""
+        if exec_parts:
+            first = Path(exec_parts[0])
+            dll_path = wd_root / "SS14.Watchdog.dll"
+            if first.name == "SS14.Watchdog" and dll_path.exists():
+                dotnet_cmd = self._embedded_ensure_dotnet_sdk()
+                exec_parts = [*dotnet_cmd, str(dll_path)]
+                dotnet_root = str(Path(dotnet_cmd[0]).resolve().parent)
+            elif first.name == "dotnet":
+                try:
+                    dotnet_root = str(first.resolve().parent)
+                except Exception:
+                    dotnet_root = str(first.parent)
         exec_start = " ".join(shlex.quote(part) for part in exec_parts)
+        env_block = ""
+        if dotnet_root:
+            env_block = (
+                f"Environment=DOTNET_ROOT={dotnet_root}\n"
+                f"Environment=DOTNET_ROOT_X64={dotnet_root}\n"
+            )
         unit_path = Path("/etc/systemd/system") / unit_name
         unit_body = (
             "[Unit]\n"
@@ -1268,6 +1287,7 @@ class AgentRuntime:
             "[Service]\n"
             "Type=simple\n"
             f"WorkingDirectory={wd_root}\n"
+            f"{env_block}"
             f"ExecStart={exec_start}\n"
             f"User={user}\n"
             f"Group={group}\n"

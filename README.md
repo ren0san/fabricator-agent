@@ -88,6 +88,7 @@ AGENT_BACKEND_URL=https://api.thun-der.ru
 AGENT_HTTP_PORT=8010
 AGENT_INSTRUCTION_WAIT_SECONDS=25
 AGENT_HEARTBEAT_SECONDS=30
+AGENT_CONFIG_SYNC_SECONDS=30
 AGENT_LOCAL_API_URL=
 AGENT_TEST_MODE=0
 AGENT_PUBLIC_IP=
@@ -110,6 +111,7 @@ Remote-only default behavior:
 - the core control plane talks to the agent via outbound long-poll + ack; no public inbound agent port is required
 - `AGENT_INSTRUCTION_WAIT_SECONDS` controls long-poll hold time on master instruction queue
 - `AGENT_HEARTBEAT_SECONDS` controls how often the agent sends heartbeat while pull runs continuously
+- `AGENT_CONFIG_SYNC_SECONDS` controls how often the agent scans and uploads changed remote `config.toml` snapshots to the master cache
 - local edge token fallback order:
   - `AGENT_LOCAL_API_TOKEN`
   - `SS14_EDGE_API_TOKEN`

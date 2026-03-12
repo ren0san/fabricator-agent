@@ -274,6 +274,10 @@ class AgentRuntime:
         self.timeout = int(_env("AGENT_HTTP_TIMEOUT_SECONDS", "10") or "10")
         self.instruction_wait_seconds = max(0, int(_env("AGENT_INSTRUCTION_WAIT_SECONDS", "25") or "25"))
         self.heartbeat_seconds = max(5, int(_env("AGENT_HEARTBEAT_SECONDS", "30") or "30"))
+        self.config_sync_seconds = max(
+            5,
+            int(_env("AGENT_CONFIG_SYNC_SECONDS", str(self.heartbeat_seconds)) or str(self.heartbeat_seconds)),
+        )
         self.runtime_post_retries = max(1, int(_env("AGENT_RUNTIME_POST_RETRIES", "3") or "3"))
         self.runtime_post_retry_delay = max(
             0.1,
@@ -300,6 +304,9 @@ class AgentRuntime:
             "last_instruction_result": None,
             "last_pull_next_poll_seconds": None,
             "config_sha256": None,
+            "last_config_snapshot_sync_at": None,
+            "last_config_snapshot_count": 0,
+            "last_config_snapshot_error": None,
             "claim_code": None,
             "paired": False,
             "legacy_auth_disabled": False,
@@ -309,6 +316,8 @@ class AgentRuntime:
             "mode": "test-local" if self.test_mode else "runtime",
         }
         self._next_heartbeat_at = 0.0
+        self._next_config_sync_at = 0.0
+        self._config_snapshot_hashes: dict[str, str] = {}
         self._load_token_file()
 
     @staticmethod
@@ -394,6 +403,8 @@ class AgentRuntime:
         self.status["claim_code"] = None
         self._clear_token_file()
         self.status["last_error"] = reason
+        self._next_config_sync_at = 0.0
+        self._config_snapshot_hashes.clear()
 
     def _read_config(self) -> tuple[dict[str, Any] | None, str | None]:
         if not self.config_path.exists():
@@ -402,6 +413,98 @@ class AgentRuntime:
         sha = hashlib.sha256(raw).hexdigest()
         parsed = tomllib.loads(raw.decode("utf-8", errors="ignore"))
         return parsed, sha
+
+    def _config_sync_due(self) -> bool:
+        return time.time() >= float(self._next_config_sync_at or 0.0)
+
+    def _list_embedded_instance_config_paths(self) -> dict[str, Path]:
+        template_root = Path(_env("SS14_WD_ROOT", "/opt/ss14/wds/watchdog") or "/opt/ss14/wds/watchdog")
+        dedicated_base = Path(
+            _env(
+                "SS14_WD_DEDICATED_BASE",
+                str(template_root.parent.parent if template_root.parent.name == "wds" else template_root.parent),
+            )
+            or str(template_root.parent.parent if template_root.parent.name == "wds" else template_root.parent)
+        )
+        items: dict[str, Path] = {}
+        legacy_root = template_root / "instances"
+        try:
+            for cfg_path in legacy_root.glob("*/config.toml"):
+                if not cfg_path.is_file():
+                    continue
+                slug = str(cfg_path.parent.name or "").strip().lower()
+                if slug:
+                    items.setdefault(slug, cfg_path)
+        except Exception:
+            logger.exception("Legacy config snapshot scan failed root=%s", legacy_root)
+        dedicated_prefix = f"{template_root.name}-"
+        try:
+            for wd_root in dedicated_base.glob(f"{dedicated_prefix}*"):
+                if not wd_root.is_dir():
+                    continue
+                slug = str(wd_root.name[len(dedicated_prefix):] or "").strip().lower()
+                if not slug:
+                    continue
+                cfg_path = wd_root / "instances" / slug / "config.toml"
+                if cfg_path.is_file():
+                    items[slug] = cfg_path
+        except Exception:
+            logger.exception("Dedicated config snapshot scan failed base=%s", dedicated_base)
+        return items
+
+    def _sync_config_snapshots(self, *, force: bool = False) -> None:
+        self._next_config_sync_at = time.time() + float(self.config_sync_seconds)
+        if not self.agent_token:
+            return
+        cfg_paths = self._list_embedded_instance_config_paths()
+        current_slugs = set(cfg_paths.keys())
+        for slug in list(self._config_snapshot_hashes):
+            if slug not in current_slugs:
+                self._config_snapshot_hashes.pop(slug, None)
+        items: list[dict[str, Any]] = []
+        next_hashes: dict[str, str] = {}
+        for slug, cfg_path in cfg_paths.items():
+            try:
+                content = cfg_path.read_text(encoding="utf-8", errors="ignore")
+                content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                next_hashes[slug] = content_sha256
+                if not force and self._config_snapshot_hashes.get(slug) == content_sha256:
+                    continue
+                source_updated_at: float | None
+                try:
+                    source_updated_at = float(cfg_path.stat().st_mtime)
+                except Exception:
+                    source_updated_at = None
+                items.append(
+                    {
+                        "slug": slug,
+                        "config_path": str(cfg_path),
+                        "content": content,
+                        "content_sha256": content_sha256,
+                        "source_updated_at": source_updated_at,
+                    }
+                )
+            except Exception:
+                logger.exception("Config snapshot read failed slug=%s path=%s", slug, cfg_path)
+        if not items:
+            self._config_snapshot_hashes.update(next_hashes)
+            self.status["last_config_snapshot_sync_at"] = time.time()
+            self.status["last_config_snapshot_count"] = 0
+            self.status["last_config_snapshot_error"] = None
+            return
+        res = self._post_with_retries(
+            f"{self.backend_url}/api/agent/runtime/{self.agent_id}/config-snapshots",
+            json={"items": items},
+            headers=self._runtime_headers(),
+        )
+        if res.status_code == 401:
+            self._invalidate_runtime_token("Runtime token rejected while syncing config snapshots; re-enrolling")
+            return
+        res.raise_for_status()
+        self._config_snapshot_hashes.update(next_hashes)
+        self.status["last_config_snapshot_sync_at"] = time.time()
+        self.status["last_config_snapshot_count"] = len(items)
+        self.status["last_config_snapshot_error"] = None
 
     def _register(self, cfg: dict[str, Any] | None, cfg_sha: str | None) -> None:
         if not self.api_token or self._legacy_auth_disabled:
@@ -993,7 +1096,16 @@ class AgentRuntime:
         try:
             cfg_path = self._embedded_instance_config_path(slug)
             content = cfg_path.read_text(encoding="utf-8", errors="ignore")
-            return True, {"slug": str(slug or "").strip().lower(), "content": content}, None
+            return (
+                True,
+                {
+                    "slug": str(slug or "").strip().lower(),
+                    "content": content,
+                    "config_path": str(cfg_path),
+                    "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                },
+                None,
+            )
         except ValueError as exc:
             return False, {"status_code": 404}, str(exc)
         except Exception as exc:
@@ -1017,7 +1129,17 @@ class AgentRuntime:
             except Exception:
                 pass
             cfg_path.write_text(text, encoding="utf-8")
-            return True, {"slug": slug_norm, "status": "config_updated"}, None
+            return (
+                True,
+                {
+                    "slug": slug_norm,
+                    "status": "config_updated",
+                    "content": text,
+                    "config_path": str(cfg_path),
+                    "content_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                },
+                None,
+            )
         except Exception as exc:
             return False, {}, str(exc)
 
@@ -2033,6 +2155,12 @@ class AgentRuntime:
                     self._register(cfg, cfg_sha)
                 if self._heartbeat_due():
                     self._heartbeat(cfg_sha)
+                if self._config_sync_due():
+                    try:
+                        self._sync_config_snapshots()
+                    except Exception as exc:
+                        self.status["last_config_snapshot_error"] = str(exc)
+                        logger.exception("Config snapshot sync failed")
                 items, next_poll_seconds = self._pull()
                 self.status["last_instruction_count"] = len(items)
                 sleep_seconds = float(next_poll_seconds if not items else 0.0)
@@ -2092,6 +2220,8 @@ class AgentRuntime:
                     self.status["last_instruction_result"] = result or {}
                     if error:
                         cycle_error = error
+                    if ok and instruction_kind in {"create-slug", "create-instance"}:
+                        self._next_config_sync_at = 0.0
                     if instruction_id:
                         self._ack(instruction_id, ok=ok, result=result, error=error)
                 self.status["last_error"] = cycle_error
@@ -2164,6 +2294,7 @@ def status() -> dict[str, Any]:
         "poll_seconds": runtime.poll_seconds,
         "instruction_wait_seconds": runtime.instruction_wait_seconds,
         "heartbeat_seconds": runtime.heartbeat_seconds,
+        "config_sync_seconds": runtime.config_sync_seconds,
         "runtime_pid": os.getpid(),
         "http_port": http_port,
         "config_path": str(runtime.config_path),

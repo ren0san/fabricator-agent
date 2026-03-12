@@ -317,6 +317,8 @@ class AgentRuntime:
             "stop-instance",
             "update-instance",
             "repair-instance",
+            "get-instance-config",
+            "set-instance-config",
         ]
 
     def _resolve_agent_id(self) -> str:
@@ -2024,6 +2026,27 @@ class AgentRuntime:
                         ok, result, error = self._execute_instruction(item)
                     except Exception as exc:
                         ok, result, error = False, {}, str(exc)
+                    if instruction_id and instruction_kind in {"get-instance-config", "set-instance-config"}:
+                        try:
+                            self._progress(
+                                instruction_id,
+                                execution_state="completed" if ok else "failed",
+                                stage="result",
+                                message=(None if ok else (str(error or "").strip() or "instruction failed")),
+                                result=result or None,
+                            )
+                            logger.info(
+                                "Instruction terminal progress sent kind=%s id=%s ok=%s",
+                                instruction_kind,
+                                instruction_id,
+                                ok,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Instruction terminal progress failed kind=%s id=%s",
+                                instruction_kind,
+                                instruction_id,
+                            )
                     self.status["last_instruction_ok"] = bool(ok)
                     self.status["last_instruction_error"] = error
                     self.status["last_instruction_result"] = result or {}

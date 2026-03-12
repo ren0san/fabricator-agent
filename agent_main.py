@@ -272,6 +272,11 @@ class AgentRuntime:
         self.token_file = Path(_env("AGENT_TOKEN_FILE", "/opt/fabricator-agent/agent.token") or "/opt/fabricator-agent/agent.token")
         self.poll_seconds = int(_env("AGENT_POLL_SECONDS", "10") or "10")
         self.timeout = int(_env("AGENT_HTTP_TIMEOUT_SECONDS", "10") or "10")
+        self.runtime_post_retries = max(1, int(_env("AGENT_RUNTIME_POST_RETRIES", "3") or "3"))
+        self.runtime_post_retry_delay = max(
+            0.1,
+            float(_env("AGENT_RUNTIME_POST_RETRY_DELAY_SECONDS", "0.5") or "0.5"),
+        )
         self.diagnostic_timeout = int(_env("AGENT_DIAG_TIMEOUT_SECONDS", "45") or "45")
         self.output_tail_chars = int(_env("AGENT_OUTPUT_TAIL_CHARS", "4000") or "4000")
         self.fabricator_service_name = _env("AGENT_FABRICATOR_SERVICE", "ss14-provisioner") or "ss14-provisioner"
@@ -524,12 +529,12 @@ class AgentRuntime:
         return items
 
     def _ack(self, instruction_id: str, ok: bool, result: dict[str, Any] | None = None, error: str | None = None) -> None:
+        payload = {"ok": bool(ok), "result": result or {}, "error": error}
         if self.agent_token:
-            res = requests.post(
+            res = self._post_with_retries(
                 f"{self.backend_url}/api/agent/runtime/{self.agent_id}/instructions/{instruction_id}/ack",
-                json={"ok": bool(ok), "result": result or {}, "error": error},
+                json=payload,
                 headers=self._runtime_headers(),
-                timeout=self.timeout,
             )
             if res.status_code == 401:
                 self._invalidate_runtime_token("Runtime token rejected while ack; re-enrolling")
@@ -538,17 +543,34 @@ class AgentRuntime:
             return
         if self._legacy_auth_disabled:
             return
-        res = requests.post(
+        res = self._post_with_retries(
             f"{self.backend_url}/api/agent/instructions/{self.agent_id}/{instruction_id}/ack",
-            json={"ok": bool(ok), "result": result or {}, "error": error},
+            json=payload,
             headers=self._headers(),
-            timeout=self.timeout,
         )
         if res.status_code == 401:
             self._legacy_auth_disabled = True
             self.status["legacy_auth_disabled"] = True
             return
         res.raise_for_status()
+
+    def _post_with_retries(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> requests.Response:
+        last_exc: requests.RequestException | None = None
+        for attempt in range(self.runtime_post_retries):
+            try:
+                return requests.post(
+                    url,
+                    json=json,
+                    headers=headers,
+                    timeout=self.timeout,
+                )
+            except requests.RequestException as exc:
+                last_exc = exc
+                if attempt + 1 < self.runtime_post_retries:
+                    time.sleep(self.runtime_post_retry_delay * float(attempt + 1))
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("runtime post failed with unknown error")
 
     def _progress(
         self,
@@ -561,7 +583,7 @@ class AgentRuntime:
     ) -> None:
         if not self.agent_token:
             return
-        res = requests.post(
+        res = self._post_with_retries(
             f"{self.backend_url}/api/agent/runtime/{self.agent_id}/instructions/{instruction_id}/progress",
             json={
                 "execution_state": str(execution_state or "").strip().lower(),
@@ -570,7 +592,6 @@ class AgentRuntime:
                 "result": result or None,
             },
             headers=self._runtime_headers(),
-            timeout=self.timeout,
         )
         if res.status_code == 401:
             self._invalidate_runtime_token("Runtime token rejected while sending progress; re-enrolling")
